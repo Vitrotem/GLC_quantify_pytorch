@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "vitrotem-grid-ai"
+version = "0.1.0"
+description = "Quantify GLC coverage in TEM grid circles via interactive levels and segmentation"
+readme = "README.md"
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+Pillow = "10.4.0"
+numpy = "1.26.4"
+opencv-python-headless = "4.10.0.84"
+
+[tool.poetry.scripts]
+vt-quantify = "src.quantify:main"
+vt-to-jpg = "src.to_jpg:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
