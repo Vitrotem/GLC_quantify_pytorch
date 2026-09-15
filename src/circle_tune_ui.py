@@ -19,7 +19,7 @@ from src.preprocessing import (
     SINGLE_HOUGH_MIN_DIST_FACTOR,
     SINGLE_HOUGH_PARAM2,
     apply_levels_params,
-    coverage_stats,
+    build_circle_mask,
     crop_metadata,
     default_single_circle_radii,
     detect_circles,
@@ -27,15 +27,17 @@ from src.preprocessing import (
     inset_circles,
     intensity_histogram,
     matches_skip_center,
-    mean_coverage,
     render_segmentation_overlay,
-    segment_glc_params,
+    segment_glc,
 )
 
 PREVIEW_MAX_DIM = 900
+SEG_PREVIEW_MAX_DIM = 520
 HIST_WIDTH = 256
 HIST_HEIGHT = 80
-DEBOUNCE_MS = 80
+DETECT_DEBOUNCE_MS = 80
+LEVELS_DEBOUNCE_MS = 25
+SEG_DEBOUNCE_MS = 35
 KEEP_COLOR = (0, 220, 0)
 SKIP_COLOR = (220, 40, 40)
 INSET_COLOR = (0, 200, 255)
@@ -50,17 +52,6 @@ class QuantifySession:
     levels: LevelsParams
     seg: SegParams
     inner_offset_pct: float = DEFAULT_INNER_OFFSET_PCT
-
-
-def _resize_for_preview(rgb: np.ndarray, display_scale: float) -> Image.Image:
-    if display_scale < 1.0:
-        h, w = rgb.shape[:2]
-        rgb = cv2.resize(
-            rgb,
-            (int(w * display_scale), int(h * display_scale)),
-            interpolation=cv2.INTER_AREA,
-        )
-    return Image.fromarray(rgb, mode="RGB")
 
 
 def _draw_circles_on_rgb(
@@ -89,6 +80,29 @@ def _draw_circles_on_rgb(
                 if inset_r < r:
                     cv2.circle(rgb, (x, y), inset_r, INSET_COLOR, thickness)
     return rgb, kept, skipped
+
+
+def _scale_circles(
+    circles: list[tuple[int, int, int]], scale: float
+) -> list[tuple[int, int, int]]:
+    if scale >= 1.0:
+        return list(circles)
+    return [
+        (
+            int(round(x * scale)),
+            int(round(y * scale)),
+            max(1, int(round(r * scale))),
+        )
+        for x, y, r in circles
+    ]
+
+
+def _scale_points(
+    points: list[tuple[int, int]], scale: float
+) -> list[tuple[int, int]]:
+    if scale >= 1.0:
+        return list(points)
+    return [(int(round(x * scale)), int(round(y * scale))) for x, y in points]
 
 
 def _render_histogram(
@@ -137,6 +151,26 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     cropped, _ = crop_metadata(gray)
     h, w = cropped.shape
     display_scale = min(1.0, PREVIEW_MAX_DIM / max(h, w))
+    if display_scale < 1.0:
+        preview_gray = cv2.resize(
+            cropped,
+            (int(w * display_scale), int(h * display_scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        preview_gray = cropped
+    seg_scale = min(1.0, SEG_PREVIEW_MAX_DIM / max(preview_gray.shape))
+    if seg_scale < 1.0:
+        ph, pw = preview_gray.shape
+        seg_preview_gray = cv2.resize(
+            preview_gray,
+            (int(pw * seg_scale), int(ph * seg_scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        seg_preview_gray = preview_gray
+    # Combined scale from full-res → seg preview (for min_size / circle coords).
+    full_to_seg_scale = display_scale * seg_scale
     base_hist = intensity_histogram(cropped)
 
     detect_defaults = CircleDetectParams()
@@ -147,6 +181,8 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     skipped_centers: list[tuple[int, int]] = []
     current_circles: list[tuple[int, int, int]] = []
     step = {"n": 1}
+    cached_circles: list[tuple[int, int, int]] = []
+    cached_detect_key: list[tuple[object, ...] | None] = [None]
 
     root = tk.Tk()
     root.title(f"Quantify — {image_path.name}")
@@ -231,8 +267,24 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     min_size_var = tk.DoubleVar(value=float(seg_defaults.min_size))
 
     value_labels: dict[str, tk.StringVar] = {}
-    debounce_id: list[str | None] = [None]
+    detect_debounce_id: list[str | None] = [None]
+    levels_debounce_id: list[str | None] = [None]
+    seg_debounce_id: list[str | None] = [None]
     photo_ref: list[ImageTk.PhotoImage | None] = [None]
+    leveled_cache_key: list[tuple[float, float, float] | None] = [None]
+    leveled_cache_img: list[np.ndarray | None] = [None]
+
+    def detect_cache_key(params: CircleDetectParams) -> tuple[object, ...]:
+        return (
+            params.param1,
+            params.param2,
+            params.min_dist_factor,
+            params.min_radius_frac,
+            params.max_radius_frac,
+            params.single_circle,
+            params.min_radius_px,
+            params.max_radius_px,
+        )
 
     def current_detect_params() -> CircleDetectParams:
         if single_mode["on"]:
@@ -284,21 +336,43 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             min_size=max(0, int(round(min_size_var.get()))),
         )
 
-    def refresh_preview() -> None:
+    def ensure_leveled_seg(levels: LevelsParams) -> np.ndarray:
+        key = (levels.black, levels.gamma, levels.white)
+        if leveled_cache_key[0] != key or leveled_cache_img[0] is None:
+            leveled_cache_img[0] = apply_levels_params(seg_preview_gray, levels)
+            leveled_cache_key[0] = key
+        return leveled_cache_img[0]
+
+    def ensure_circles(detect: CircleDetectParams) -> list[tuple[int, int, int]]:
+        nonlocal current_circles, cached_circles
+        key = detect_cache_key(detect)
+        if cached_detect_key[0] != key:
+            cached_circles = detect_circles(cropped, params=detect)
+            cached_detect_key[0] = key
+        current_circles = cached_circles
+        return cached_circles
+
+    def refresh_preview(*, redetect: bool = True) -> None:
         nonlocal current_circles
         detect = current_detect_params()
         levels = current_levels()
-        circles = detect_circles(cropped, params=detect)
-        current_circles = circles
-        leveled = apply_levels_params(cropped, levels)
+        if redetect or cached_detect_key[0] is None:
+            circles = ensure_circles(detect)
+        else:
+            circles = cached_circles
+            current_circles = circles
 
         if step["n"] == 1:
             offset = current_inner_offset()
+            # Levels + draw only on preview-resolution image (much faster).
+            leveled = apply_levels_params(preview_gray, levels)
             rgb = cv2.cvtColor(leveled, cv2.COLOR_GRAY2RGB)
+            preview_circles = _scale_circles(circles, display_scale)
+            preview_skips = _scale_points(skipped_centers, display_scale)
             rgb, kept, skipped = _draw_circles_on_rgb(
-                rgb, circles, skipped_centers, display_scale, offset
+                rgb, preview_circles, preview_skips, 1.0, offset
             )
-            preview = _resize_for_preview(rgb, display_scale)
+            preview = Image.fromarray(rgb, mode="RGB")
             status_var.set(f"Circles: {kept} kept, {skipped} skipped")
 
             hist_img = _render_histogram(base_hist, levels.black, levels.gamma, levels.white)
@@ -320,18 +394,33 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             value_labels["gamma"].set(f"{levels.gamma:.2f}")
             value_labels["white"].set(f"{levels.white:.0f}")
         else:
+            # Faster interactive seg: smaller canvas, cached levels, scaled min_size.
             kept_circles = filter_skipped_circles(circles, skipped_centers)
             analysis_circles = inset_circles(kept_circles, current_inner_offset())
-            soft = segment_glc_params(leveled, analysis_circles, current_seg())
-            overlay = render_segmentation_overlay(leveled, soft, analysis_circles)
-            rgb = np.array(overlay)
-            preview = _resize_for_preview(rgb, display_scale)
-            stats = coverage_stats(soft, analysis_circles)
-            cov = mean_coverage(stats) * 100.0
+            leveled = ensure_leveled_seg(levels)
+            seg = current_seg()
+            preview_analysis = _scale_circles(analysis_circles, full_to_seg_scale)
+            min_size_preview = max(
+                0, int(round(seg.min_size * (full_to_seg_scale**2)))
+            )
+            soft = segment_glc(
+                leveled,
+                preview_analysis,
+                seg.threshold,
+                seg.fuzziness,
+                min_size=min_size_preview,
+            )
+            overlay = render_segmentation_overlay(leveled, soft, preview_analysis)
+            if seg_scale < 1.0:
+                oh, ow = preview_gray.shape
+                overlay = overlay.resize((ow, oh), Image.BILINEAR)
+            preview = overlay
+            mask = build_circle_mask(leveled.shape, preview_analysis) > 0
+            area = int(np.count_nonzero(mask))
+            cov = float(soft[mask].mean() * 100.0) if area > 0 else 0.0
             status_var.set(
                 f"Circles: {len(kept_circles)} | Coverage: {cov:.1f}%"
             )
-            seg = current_seg()
             value_labels["threshold"].set(f"{seg.threshold:.0f}")
             value_labels["fuzziness"].set(f"{seg.fuzziness:.0f}")
             value_labels["min_size"].set(f"{seg.min_size}")
@@ -340,10 +429,26 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
         photo_ref[0] = photo
         preview_label.configure(image=photo)
 
-    def schedule_refresh(*_args: object) -> None:
-        if debounce_id[0] is not None:
-            root.after_cancel(debounce_id[0])
-        debounce_id[0] = root.after(DEBOUNCE_MS, refresh_preview)
+    def schedule_detect_refresh(*_args: object) -> None:
+        if detect_debounce_id[0] is not None:
+            root.after_cancel(detect_debounce_id[0])
+        detect_debounce_id[0] = root.after(
+            DETECT_DEBOUNCE_MS, lambda: refresh_preview(redetect=True)
+        )
+
+    def schedule_levels_refresh(*_args: object) -> None:
+        if levels_debounce_id[0] is not None:
+            root.after_cancel(levels_debounce_id[0])
+        levels_debounce_id[0] = root.after(
+            LEVELS_DEBOUNCE_MS, lambda: refresh_preview(redetect=False)
+        )
+
+    def schedule_seg_refresh(*_args: object) -> None:
+        if seg_debounce_id[0] is not None:
+            root.after_cancel(seg_debounce_id[0])
+        seg_debounce_id[0] = root.after(
+            SEG_DEBOUNCE_MS, lambda: refresh_preview(redetect=False)
+        )
 
     def on_preview_click(event: tk.Event) -> None:
         if step["n"] != 1 or display_scale <= 0 or not current_circles:
@@ -372,7 +477,7 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             skipped_centers.pop(matched_idx)
         else:
             skipped_centers.append((bx, by))
-        refresh_preview()
+        refresh_preview(redetect=False)
 
     def add_slider(
         parent: ttk.Frame,
@@ -383,7 +488,10 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
         to: float,
         key: str,
         resolution: float,
+        on_change=None,
     ) -> None:
+        if on_change is None:
+            on_change = schedule_detect_refresh
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
         scale = tk.Scale(
             parent,
@@ -394,7 +502,7 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             variable=variable,
             length=220,
             showvalue=False,
-            command=lambda _v: schedule_refresh(),
+            command=lambda _v: on_change(),
         )
         scale.grid(row=row, column=1, sticky=tk.EW, padx=8, pady=2)
         value_var = tk.StringVar()
@@ -419,6 +527,7 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
         40.0,
         "inner_offset",
         0.5,
+        on_change=schedule_levels_refresh,
     )
     add_slider(
         grid_radius_frame, 0, "min dist factor", min_dist_var, 1.0, 4.0, "min_dist", 0.05
@@ -449,6 +558,7 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     def apply_circle_mode(single: bool) -> None:
         single_mode["on"] = single
         skipped_centers.clear()
+        cached_detect_key[0] = None
         if single:
             mode_btn.configure(text="Grid mode (many circles)")
             hint_var.set(
@@ -471,21 +581,39 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             min_dist_var.set(detect_defaults.min_dist_factor)
             min_r_pct_var.set(detect_defaults.min_radius_frac * 100.0)
             max_r_pct_var.set(detect_defaults.max_radius_frac * 100.0)
-        schedule_refresh()
+        schedule_detect_refresh()
 
     mode_btn.configure(command=lambda: apply_circle_mode(not single_mode["on"]))
 
     levels_sliders = ttk.Frame(levels_frame)
     levels_sliders.pack(fill=tk.X)
     levels_sliders.columnconfigure(1, weight=1)
-    add_slider(levels_sliders, 0, "black", black_var, 0, 255, "black", 1)
-    add_slider(levels_sliders, 1, "gamma", gamma_var, 0.01, 3.0, "gamma", 0.01)
-    add_slider(levels_sliders, 2, "white", white_var, 0, 255, "white", 1)
+    add_slider(
+        levels_sliders, 0, "black", black_var, 0, 255, "black", 1,
+        on_change=schedule_levels_refresh,
+    )
+    add_slider(
+        levels_sliders, 1, "gamma", gamma_var, 0.01, 3.0, "gamma", 0.01,
+        on_change=schedule_levels_refresh,
+    )
+    add_slider(
+        levels_sliders, 2, "white", white_var, 0, 255, "white", 1,
+        on_change=schedule_levels_refresh,
+    )
 
     seg_controls.columnconfigure(1, weight=1)
-    add_slider(seg_controls, 0, "threshold", threshold_var, 0, 255, "threshold", 1)
-    add_slider(seg_controls, 1, "fuzziness", fuzziness_var, 0, 64, "fuzziness", 1)
-    add_slider(seg_controls, 2, "min size px", min_size_var, 0, 5000, "min_size", 1)
+    add_slider(
+        seg_controls, 0, "threshold", threshold_var, 0, 255, "threshold", 1,
+        on_change=schedule_seg_refresh,
+    )
+    add_slider(
+        seg_controls, 1, "fuzziness", fuzziness_var, 0, 64, "fuzziness", 1,
+        on_change=schedule_seg_refresh,
+    )
+    add_slider(
+        seg_controls, 2, "min size px", min_size_var, 0, 5000, "min_size", 1,
+        on_change=schedule_seg_refresh,
+    )
 
     buttons = ttk.Frame(side)
     buttons.pack(fill=tk.X, pady=(16, 0))
@@ -517,7 +645,7 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             preview_label.configure(cursor="")
             next_btn.configure(text="Finish", command=on_finish)
             back_btn.pack(fill=tk.X, pady=(0, 4), before=next_btn)
-        refresh_preview()
+        refresh_preview(redetect=True)
 
     def on_reset() -> None:
         if step["n"] == 1:
@@ -538,11 +666,15 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             white_var.set(levels_defaults.white)
             inner_offset_var.set(DEFAULT_INNER_OFFSET_PCT)
             skipped_centers.clear()
+            cached_detect_key[0] = None
+            leveled_cache_key[0] = None
+            leveled_cache_img[0] = None
+            refresh_preview(redetect=True)
         else:
             threshold_var.set(seg_defaults.threshold)
             fuzziness_var.set(seg_defaults.fuzziness)
             min_size_var.set(float(seg_defaults.min_size))
-        refresh_preview()
+            refresh_preview(redetect=False)
 
     def on_next() -> None:
         show_step(2)

@@ -410,17 +410,19 @@ def apply_levels(
     gamma: float,
     white: float,
 ) -> np.ndarray:
-    """Apply Photoshop-style input levels to a grayscale image."""
+    """Apply Photoshop-style input levels via a 256-entry LUT (fast)."""
     black_f = float(black)
     white_f = float(white)
     # Photoshop Levels: out = v ** (1/gamma). Gamma < 1 darkens midtones.
     gamma_f = max(float(gamma), 1e-6)
     span = max(white_f - black_f, 1e-6)
 
-    x = gray.astype(np.float32)
-    v = np.clip((x - black_f) / span, 0.0, 1.0)
-    out = 255.0 * np.power(v, 1.0 / gamma_f)
-    return np.clip(out, 0.0, 255.0).astype(np.uint8)
+    xs = np.arange(256, dtype=np.float32)
+    v = np.clip((xs - black_f) / span, 0.0, 1.0)
+    lut = np.clip(255.0 * np.power(v, 1.0 / gamma_f), 0.0, 255.0).astype(np.uint8)
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+    return cv2.LUT(gray, lut)
 
 
 def apply_levels_params(gray: np.ndarray, levels: LevelsParams) -> np.ndarray:
@@ -437,25 +439,40 @@ def segment_glc(
     """Soft darker-than-threshold membership (0–1), zero outside circles.
 
     Membership is made continuous via morphological closing, then connected
-    components smaller than *min_size* pixels are removed.
+    components smaller than *min_size* pixels are removed. Work is limited to
+    the bounding box of the circles for speed.
     """
     soft = np.zeros(levels_gray.shape, dtype=np.float32)
     if not circles:
         return soft
 
-    circle_mask = build_circle_mask(levels_gray.shape, circles) > 0
-    intensity = levels_gray.astype(np.float32)
+    h, w = levels_gray.shape
+    x0 = max(0, min(x - r for x, y, r in circles))
+    y0 = max(0, min(y - r for x, y, r in circles))
+    x1 = min(w, max(x + r for x, y, r in circles) + 1)
+    y1 = min(h, max(y + r for x, y, r in circles) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return soft
+
+    roi = levels_gray[y0:y1, x0:x1]
+    roi_circles = [(x - x0, y - y0, r) for x, y, r in circles]
+    circle_mask = build_circle_mask(roi.shape, roi_circles) > 0
+
     t = float(threshold)
     f = max(float(fuzziness), 0.0)
-
+    # Soft membership via 256 LUT (uint8 intensity → float membership).
+    xs = np.arange(256, dtype=np.float32)
     if f <= 0:
-        membership = (intensity <= t).astype(np.float32)
+        membership_lut = (xs <= t).astype(np.float32)
     else:
-        # 1 if I <= T-F, 0 if I >= T+F, linear ramp between.
-        membership = np.clip((t + f - intensity) / (2.0 * f), 0.0, 1.0)
+        membership_lut = np.clip((t + f - xs) / (2.0 * f), 0.0, 1.0)
+    membership = membership_lut[roi]
 
-    soft[circle_mask] = membership[circle_mask]
-    return _enforce_continuous_min_size(soft, circle_mask, min_size)
+    soft_roi = np.zeros(roi.shape, dtype=np.float32)
+    soft_roi[circle_mask] = membership[circle_mask]
+    soft_roi = _enforce_continuous_min_size(soft_roi, circle_mask, min_size)
+    soft[y0:y1, x0:x1] = soft_roi
+    return soft
 
 
 def _enforce_continuous_min_size(
@@ -464,7 +481,7 @@ def _enforce_continuous_min_size(
     min_size: int,
 ) -> np.ndarray:
     """Close small gaps and drop connected components below *min_size*."""
-    binary = ((soft > 0.5) & circle_mask).astype(np.uint8) * 255
+    binary = ((soft > 0.5) & circle_mask).astype(np.uint8)
     if not np.any(binary):
         return soft
 
@@ -477,12 +494,15 @@ def _enforce_continuous_min_size(
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         closed, connectivity=8
     )
-    keep = np.zeros(closed.shape, dtype=bool)
+    if num_labels <= 1:
+        return np.zeros_like(soft)
+
     min_area = max(0, int(min_size))
-    for label in range(1, num_labels):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area >= min_area:
-            keep |= labels == label
+    keep_ids = np.where(stats[1:, cv2.CC_STAT_AREA] >= min_area)[0] + 1
+    if keep_ids.size == 0:
+        return np.zeros_like(soft)
+
+    keep = np.isin(labels, keep_ids)
 
     # Soft edges only where the continuous region survives.
     out = soft.copy()
@@ -558,11 +578,14 @@ def render_segmentation_overlay(
     opacity: float = GLC_OVERLAY_OPACITY,
 ) -> Image.Image:
     """Composite pink GLC membership onto levels-adjusted grayscale; optional outlines."""
-    base = cv2.cvtColor(levels_gray, cv2.COLOR_GRAY2RGB).astype(np.float32)
-    pink = np.array(color, dtype=np.float32).reshape(1, 1, 3)
-    alpha = np.clip(soft_mask.astype(np.float32) * opacity, 0.0, 1.0)[..., None]
-    blended = base * (1.0 - alpha) + pink * alpha
-    rgb = np.clip(blended, 0.0, 255.0).astype(np.uint8)
+    rgb = cv2.cvtColor(levels_gray, cv2.COLOR_GRAY2RGB)
+    alpha = np.clip(soft_mask.astype(np.float32) * opacity, 0.0, 1.0)
+    hits = alpha > 1e-4
+    if np.any(hits):
+        pink = np.array(color, dtype=np.float32)
+        region = rgb[hits].astype(np.float32)
+        a = alpha[hits][..., None]
+        rgb[hits] = np.clip(region * (1.0 - a) + pink * a, 0.0, 255.0).astype(np.uint8)
 
     if circles:
         thickness = max(1, int(round(min(levels_gray.shape) / 400)))
