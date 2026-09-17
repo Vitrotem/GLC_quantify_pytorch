@@ -33,8 +33,10 @@ DEFAULT_LEVELS_WHITE = 255.0
 DEFAULT_SEG_THRESHOLD = 128.0
 DEFAULT_SEG_FUZZINESS = 10.0
 DEFAULT_SEG_MIN_SIZE = 50
+DEFAULT_SEG_MAX_SIZE = 0  # 0 = no upper limit
+DEFAULT_SEG_GAP_FILL = 2  # closing radius (px); solidify islands without merging much
+DEFAULT_SEG_SPLIT = 0  # opening radius (px); break thin bridges between islands
 DEFAULT_INNER_OFFSET_PCT = 0.0
-SEG_CONTINUITY_KERNEL = 5
 
 
 @dataclass(frozen=True)
@@ -67,15 +69,20 @@ class LevelsParams:
 
 @dataclass(frozen=True)
 class SegParams:
-    """Soft darker-than-threshold segmentation inside circles.
+    """Soft darker-than-threshold segmentation for island / archipelago GLC.
 
-    *min_size* is the minimum connected-component area (pixels) kept after
-    morphological closing; smaller speckles are removed.
+    *gap_fill*: morphological closing radius (px) — fills holes/gaps inside islands
+    *split*: morphological opening radius (px) — breaks thin bridges so islands stay separate
+    *min_size* / *max_size*: keep connected components in this area range (px²);
+      *max_size* 0 means no upper limit
     """
 
     threshold: float = DEFAULT_SEG_THRESHOLD
     fuzziness: float = DEFAULT_SEG_FUZZINESS
     min_size: int = DEFAULT_SEG_MIN_SIZE
+    max_size: int = DEFAULT_SEG_MAX_SIZE
+    gap_fill: int = DEFAULT_SEG_GAP_FILL
+    split: int = DEFAULT_SEG_SPLIT
 
 
 @dataclass(frozen=True)
@@ -435,12 +442,15 @@ def segment_glc(
     threshold: float,
     fuzziness: float,
     min_size: int = DEFAULT_SEG_MIN_SIZE,
+    max_size: int = DEFAULT_SEG_MAX_SIZE,
+    gap_fill: int = DEFAULT_SEG_GAP_FILL,
+    split: int = DEFAULT_SEG_SPLIT,
 ) -> np.ndarray:
     """Soft darker-than-threshold membership (0–1), zero outside circles.
 
-    Membership is made continuous via morphological closing, then connected
-    components smaller than *min_size* pixels are removed. Work is limited to
-    the bounding box of the circles for speed.
+    Refines disconnected islands via gap-fill (close), split (open), then
+    min/max connected-component size filtering. Work is limited to the
+    bounding box of the circles for speed.
     """
     soft = np.zeros(levels_gray.shape, dtype=np.float32)
     if not circles:
@@ -460,7 +470,6 @@ def segment_glc(
 
     t = float(threshold)
     f = max(float(fuzziness), 0.0)
-    # Soft membership via 256 LUT (uint8 intensity → float membership).
     xs = np.arange(256, dtype=np.float32)
     if f <= 0:
         membership_lut = (xs <= t).astype(np.float32)
@@ -470,46 +479,78 @@ def segment_glc(
 
     soft_roi = np.zeros(roi.shape, dtype=np.float32)
     soft_roi[circle_mask] = membership[circle_mask]
-    soft_roi = _enforce_continuous_min_size(soft_roi, circle_mask, min_size)
+    soft_roi = _refine_islands(
+        soft_roi,
+        circle_mask,
+        min_size=min_size,
+        max_size=max_size,
+        gap_fill=gap_fill,
+        split=split,
+    )
     soft[y0:y1, x0:x1] = soft_roi
     return soft
 
 
-def _enforce_continuous_min_size(
+def _odd_kernel(radius_px: int) -> np.ndarray | None:
+    """Ellipse structuring element from a radius in pixels; None if radius < 1."""
+    r = max(0, int(radius_px))
+    if r < 1:
+        return None
+    k = 2 * r + 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+
+def _refine_islands(
     soft: np.ndarray,
     circle_mask: np.ndarray,
     min_size: int,
+    max_size: int,
+    gap_fill: int,
+    split: int,
 ) -> np.ndarray:
-    """Close small gaps and drop connected components below *min_size*."""
+    """Morphology + size filter for archipelago / island components."""
     binary = ((soft > 0.5) & circle_mask).astype(np.uint8)
     if not np.any(binary):
         return soft
 
-    k = max(1, int(SEG_CONTINUITY_KERNEL))
-    if k % 2 == 0:
-        k += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    close_k = _odd_kernel(gap_fill)
+    if close_k is not None:
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k)
+
+    open_k = _odd_kernel(split)
+    if open_k is not None:
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k)
+
+    # Fill holes inside each island (external contours only).
+    filled = np.zeros_like(binary)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(filled, contours, -1, 1, thickness=-1)
+        filled[~circle_mask] = 0
+        binary = filled
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        closed, connectivity=8
+        binary, connectivity=8
     )
     if num_labels <= 1:
         return np.zeros_like(soft)
 
+    areas = stats[1:, cv2.CC_STAT_AREA]
     min_area = max(0, int(min_size))
-    keep_ids = np.where(stats[1:, cv2.CC_STAT_AREA] >= min_area)[0] + 1
+    keep = areas >= min_area
+    if int(max_size) > 0:
+        keep &= areas <= int(max_size)
+    keep_ids = np.where(keep)[0] + 1
     if keep_ids.size == 0:
         return np.zeros_like(soft)
 
-    keep = np.isin(labels, keep_ids)
+    keep_mask = np.isin(labels, keep_ids)
 
-    # Soft edges only where the continuous region survives.
     out = soft.copy()
-    out[~keep] = 0.0
-    # Fill closed gaps that were below the soft 0.5 cutoff but inside a kept region.
-    gap = keep & (out <= 0.0) & circle_mask
-    out[gap] = 1.0
+    out[~keep_mask] = 0.0
+    # Solidify morphology-filled pixels inside kept islands.
+    filled = keep_mask & (out <= 0.0) & circle_mask
+    out[filled] = 1.0
     out[~circle_mask] = 0.0
     return out
 
@@ -525,6 +566,9 @@ def segment_glc_params(
         seg.threshold,
         seg.fuzziness,
         min_size=seg.min_size,
+        max_size=seg.max_size,
+        gap_fill=seg.gap_fill,
+        split=seg.split,
     )
 
 

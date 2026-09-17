@@ -265,6 +265,9 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     threshold_var = tk.DoubleVar(value=seg_defaults.threshold)
     fuzziness_var = tk.DoubleVar(value=seg_defaults.fuzziness)
     min_size_var = tk.DoubleVar(value=float(seg_defaults.min_size))
+    max_size_var = tk.DoubleVar(value=float(seg_defaults.max_size))
+    gap_fill_var = tk.DoubleVar(value=float(seg_defaults.gap_fill))
+    split_var = tk.DoubleVar(value=float(seg_defaults.split))
 
     value_labels: dict[str, tk.StringVar] = {}
     detect_debounce_id: list[str | None] = [None]
@@ -334,6 +337,9 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             threshold=float(threshold_var.get()),
             fuzziness=max(float(fuzziness_var.get()), 0.0),
             min_size=max(0, int(round(min_size_var.get()))),
+            max_size=max(0, int(round(max_size_var.get()))),
+            gap_fill=max(0, int(round(gap_fill_var.get()))),
+            split=max(0, int(round(split_var.get()))),
         )
 
     def ensure_leveled_seg(levels: LevelsParams) -> np.ndarray:
@@ -400,15 +406,22 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             leveled = ensure_leveled_seg(levels)
             seg = current_seg()
             preview_analysis = _scale_circles(analysis_circles, full_to_seg_scale)
-            min_size_preview = max(
-                0, int(round(seg.min_size * (full_to_seg_scale**2)))
+            area_scale = full_to_seg_scale**2
+            min_size_preview = max(0, int(round(seg.min_size * area_scale)))
+            max_size_preview = (
+                max(0, int(round(seg.max_size * area_scale))) if seg.max_size > 0 else 0
             )
+            gap_fill_preview = max(0, int(round(seg.gap_fill * full_to_seg_scale)))
+            split_preview = max(0, int(round(seg.split * full_to_seg_scale)))
             soft = segment_glc(
                 leveled,
                 preview_analysis,
                 seg.threshold,
                 seg.fuzziness,
                 min_size=min_size_preview,
+                max_size=max_size_preview,
+                gap_fill=gap_fill_preview,
+                split=split_preview,
             )
             overlay = render_segmentation_overlay(leveled, soft, preview_analysis)
             if seg_scale < 1.0:
@@ -424,6 +437,9 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             value_labels["threshold"].set(f"{seg.threshold:.0f}")
             value_labels["fuzziness"].set(f"{seg.fuzziness:.0f}")
             value_labels["min_size"].set(f"{seg.min_size}")
+            value_labels["max_size"].set(f"{seg.max_size}")
+            value_labels["gap_fill"].set(f"{seg.gap_fill}")
+            value_labels["split"].set(f"{seg.split}")
 
         photo = ImageTk.PhotoImage(preview)
         photo_ref[0] = photo
@@ -611,7 +627,19 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
         on_change=schedule_seg_refresh,
     )
     add_slider(
-        seg_controls, 2, "min size px", min_size_var, 0, 5000, "min_size", 1,
+        seg_controls, 2, "gap fill px", gap_fill_var, 0, 20, "gap_fill", 1,
+        on_change=schedule_seg_refresh,
+    )
+    add_slider(
+        seg_controls, 3, "split px", split_var, 0, 20, "split", 1,
+        on_change=schedule_seg_refresh,
+    )
+    add_slider(
+        seg_controls, 4, "min island px", min_size_var, 0, 5000, "min_size", 1,
+        on_change=schedule_seg_refresh,
+    )
+    add_slider(
+        seg_controls, 5, "max island px", max_size_var, 0, 200000, "max_size", 50,
         on_change=schedule_seg_refresh,
     )
 
@@ -637,8 +665,9 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
         else:
             step_var.set("Step 2 of 2 — Segmentation")
             hint_var.set(
-                "Pink = continuous GLC (darker than threshold)\n"
-                "Adjust threshold, fuzziness, and min size"
+                "Pink = GLC islands (darker than threshold)\n"
+                "gap fill joins within an island; split breaks bridges\n"
+                "min/max island size filters speckles / huge blobs"
             )
             step1_frame.pack_forget()
             step2_frame.pack(fill=tk.X)
@@ -674,6 +703,9 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             threshold_var.set(seg_defaults.threshold)
             fuzziness_var.set(seg_defaults.fuzziness)
             min_size_var.set(float(seg_defaults.min_size))
+            max_size_var.set(float(seg_defaults.max_size))
+            gap_fill_var.set(float(seg_defaults.gap_fill))
+            split_var.set(float(seg_defaults.split))
             refresh_preview(redetect=False)
 
     def on_next() -> None:

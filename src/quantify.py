@@ -234,7 +234,10 @@ def main() -> None:
             f"{shared_session.levels.white:.0f}), "
             f"threshold={shared_session.seg.threshold:.0f}, "
             f"fuzziness={shared_session.seg.fuzziness:.0f}, "
+            f"gap_fill={shared_session.seg.gap_fill}, "
+            f"split={shared_session.seg.split}, "
             f"min_size={shared_session.seg.min_size}, "
+            f"max_size={shared_session.seg.max_size}, "
             f"inner_offset={shared_session.inner_offset_pct:.1f}%"
         )
     elif args.no_ui:
