@@ -233,7 +233,6 @@ def main() -> None:
             f"{shared_session.levels.gamma:.2f}, "
             f"{shared_session.levels.white:.0f}), "
             f"threshold={shared_session.seg.threshold:.0f}, "
-            f"fuzziness={shared_session.seg.fuzziness:.0f}, "
             f"gap_fill={shared_session.seg.gap_fill}, "
             f"split={shared_session.seg.split}, "
             f"min_size={shared_session.seg.min_size}, "

@@ -28,7 +28,7 @@ quantify path/to/folder/
 Opens an interactive two-step wizard on the **first** image:
 
 1. **Circles + Levels** — tune Hough circle detection, skip false circles, adjust input levels (black / gamma / white). Click **Next**.
-2. **Segmentation** — adjust **threshold** and **fuzziness**; pink overlay marks darker-than-threshold GLC within kept circles. Click **Finish**.
+2. **Segmentation** — adjust **threshold** and island filters; pink overlay marks darker-than-threshold GLC within kept circles. Click **Finish**.
 
 Those settings are then applied to every image in the folder. Use `--per-image` to run the wizard for each image instead. Use `--no-ui` to skip the wizard and use defaults.
 
@@ -49,5 +49,5 @@ Supported formats: `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`
 
 1. Detect grid circles (Hough + filters); optionally skip false positives
 2. Apply Photoshop-style input levels to the grid
-3. Soft-threshold darker pixels inside each circle (threshold + fuzziness)
+3. Threshold darker pixels inside each circle
 4. Report coverage = sum of soft membership / circle area; export crops and overlays

@@ -19,16 +19,18 @@ from src.preprocessing import (
     SINGLE_HOUGH_MIN_DIST_FACTOR,
     SINGLE_HOUGH_PARAM2,
     apply_levels_params,
-    build_circle_mask,
     crop_metadata,
+    coverage_stats,
     default_single_circle_radii,
     detect_circles,
     filter_skipped_circles,
     inset_circles,
     intensity_histogram,
     matches_skip_center,
+    mean_coverage,
     render_segmentation_overlay,
     segment_glc,
+    segment_glc_params,
 )
 
 PREVIEW_MAX_DIM = 900
@@ -38,6 +40,8 @@ HIST_HEIGHT = 80
 DETECT_DEBOUNCE_MS = 80
 LEVELS_DEBOUNCE_MS = 25
 SEG_DEBOUNCE_MS = 35
+# Full-res seg matches quantify; refine mask + coverage after slider idle.
+FULL_SEG_DEBOUNCE_MS = 280
 KEEP_COLOR = (0, 220, 0)
 SKIP_COLOR = (220, 40, 40)
 INSET_COLOR = (0, 200, 255)
@@ -263,7 +267,6 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     seg_controls = ttk.LabelFrame(step2_frame, text="Segmentation", padding=4)
     seg_controls.pack(fill=tk.X)
     threshold_var = tk.DoubleVar(value=seg_defaults.threshold)
-    fuzziness_var = tk.DoubleVar(value=seg_defaults.fuzziness)
     min_size_var = tk.DoubleVar(value=float(seg_defaults.min_size))
     max_size_var = tk.DoubleVar(value=float(seg_defaults.max_size))
     gap_fill_var = tk.DoubleVar(value=float(seg_defaults.gap_fill))
@@ -273,9 +276,18 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     detect_debounce_id: list[str | None] = [None]
     levels_debounce_id: list[str | None] = [None]
     seg_debounce_id: list[str | None] = [None]
+    full_seg_debounce_id: list[str | None] = [None]
+    full_seg_generation: list[int] = [0]
     photo_ref: list[ImageTk.PhotoImage | None] = [None]
+    # Low-res levels cache (fast soft membership only).
     leveled_cache_key: list[tuple[float, float, float] | None] = [None]
     leveled_cache_img: list[np.ndarray | None] = [None]
+    # Display-scale levels cache (sharp base image for overlays).
+    display_leveled_cache_key: list[tuple[float, float, float] | None] = [None]
+    display_leveled_cache_img: list[np.ndarray | None] = [None]
+    full_leveled_cache_key: list[tuple[float, float, float] | None] = [None]
+    full_leveled_cache_img: list[np.ndarray | None] = [None]
+    last_full_coverage_pct: list[float | None] = [None]
 
     def detect_cache_key(params: CircleDetectParams) -> tuple[object, ...]:
         return (
@@ -335,7 +347,6 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
     def current_seg() -> SegParams:
         return SegParams(
             threshold=float(threshold_var.get()),
-            fuzziness=max(float(fuzziness_var.get()), 0.0),
             min_size=max(0, int(round(min_size_var.get()))),
             max_size=max(0, int(round(max_size_var.get()))),
             gap_fill=max(0, int(round(gap_fill_var.get()))),
@@ -349,6 +360,20 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             leveled_cache_key[0] = key
         return leveled_cache_img[0]
 
+    def ensure_leveled_display(levels: LevelsParams) -> np.ndarray:
+        key = (levels.black, levels.gamma, levels.white)
+        if display_leveled_cache_key[0] != key or display_leveled_cache_img[0] is None:
+            display_leveled_cache_img[0] = apply_levels_params(preview_gray, levels)
+            display_leveled_cache_key[0] = key
+        return display_leveled_cache_img[0]
+
+    def ensure_leveled_full(levels: LevelsParams) -> np.ndarray:
+        key = (levels.black, levels.gamma, levels.white)
+        if full_leveled_cache_key[0] != key or full_leveled_cache_img[0] is None:
+            full_leveled_cache_img[0] = apply_levels_params(cropped, levels)
+            full_leveled_cache_key[0] = key
+        return full_leveled_cache_img[0]
+
     def ensure_circles(detect: CircleDetectParams) -> list[tuple[int, int, int]]:
         nonlocal current_circles, cached_circles
         key = detect_cache_key(detect)
@@ -357,6 +382,59 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             cached_detect_key[0] = key
         current_circles = cached_circles
         return cached_circles
+
+    def _seg_status_text(n_circles: int, coverage_pct: float | None) -> str:
+        if coverage_pct is None:
+            return f"Circles: {n_circles} | Coverage: …"
+        return f"Circles: {n_circles} | Coverage: {coverage_pct:.1f}%"
+
+    def _show_seg_overlay(
+        soft: np.ndarray,
+        analysis_circles: list[tuple[int, int, int]],
+        levels: LevelsParams,
+    ) -> None:
+        """Composite soft mask onto the sharp display-scale levels image."""
+        leveled_display = ensure_leveled_display(levels)
+        dh, dw = leveled_display.shape
+        if soft.shape != leveled_display.shape:
+            soft_display = cv2.resize(soft, (dw, dh), interpolation=cv2.INTER_LINEAR)
+        else:
+            soft_display = soft
+        display_circles = _scale_circles(analysis_circles, display_scale)
+        overlay = render_segmentation_overlay(
+            leveled_display, soft_display, display_circles
+        )
+        photo = ImageTk.PhotoImage(overlay)
+        photo_ref[0] = photo
+        preview_label.configure(image=photo)
+
+    def refresh_full_segmentation(expected_gen: int) -> None:
+        """Full-resolution seg + coverage (matches quantify); updates overlay and status."""
+        if step["n"] != 2 or expected_gen != full_seg_generation[0]:
+            return
+        circles = cached_circles
+        kept_circles = filter_skipped_circles(circles, skipped_centers)
+        analysis_circles = inset_circles(kept_circles, current_inner_offset())
+        levels = current_levels()
+        seg = current_seg()
+        leveled_full = ensure_leveled_full(levels)
+        soft = segment_glc_params(leveled_full, analysis_circles, seg)
+        if expected_gen != full_seg_generation[0]:
+            return
+        stats = coverage_stats(soft, analysis_circles)
+        cov = mean_coverage(stats) * 100.0
+        last_full_coverage_pct[0] = cov
+        status_var.set(_seg_status_text(len(kept_circles), cov))
+        _show_seg_overlay(soft, analysis_circles, levels)
+
+    def schedule_full_seg_refresh() -> None:
+        full_seg_generation[0] += 1
+        gen = full_seg_generation[0]
+        if full_seg_debounce_id[0] is not None:
+            root.after_cancel(full_seg_debounce_id[0])
+        full_seg_debounce_id[0] = root.after(
+            FULL_SEG_DEBOUNCE_MS, lambda: refresh_full_segmentation(gen)
+        )
 
     def refresh_preview(*, redetect: bool = True) -> None:
         nonlocal current_circles
@@ -400,11 +478,12 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             value_labels["gamma"].set(f"{levels.gamma:.2f}")
             value_labels["white"].set(f"{levels.white:.0f}")
         else:
-            # Faster interactive seg: smaller canvas, cached levels, scaled min_size.
+            # Responsive soft mask on low-res, always composited onto sharp display-scale
+            # base. Coverage + refined mask come from full-res after idle.
             kept_circles = filter_skipped_circles(circles, skipped_centers)
             analysis_circles = inset_circles(kept_circles, current_inner_offset())
-            leveled = ensure_leveled_seg(levels)
             seg = current_seg()
+            leveled_lo = ensure_leveled_seg(levels)
             preview_analysis = _scale_circles(analysis_circles, full_to_seg_scale)
             area_scale = full_to_seg_scale**2
             min_size_preview = max(0, int(round(seg.min_size * area_scale)))
@@ -413,8 +492,8 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             )
             gap_fill_preview = max(0, int(round(seg.gap_fill * full_to_seg_scale)))
             split_preview = max(0, int(round(seg.split * full_to_seg_scale)))
-            soft = segment_glc(
-                leveled,
+            soft_lo = segment_glc(
+                leveled_lo,
                 preview_analysis,
                 seg.threshold,
                 seg.fuzziness,
@@ -423,23 +502,16 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
                 gap_fill=gap_fill_preview,
                 split=split_preview,
             )
-            overlay = render_segmentation_overlay(leveled, soft, preview_analysis)
-            if seg_scale < 1.0:
-                oh, ow = preview_gray.shape
-                overlay = overlay.resize((ow, oh), Image.BILINEAR)
-            preview = overlay
-            mask = build_circle_mask(leveled.shape, preview_analysis) > 0
-            area = int(np.count_nonzero(mask))
-            cov = float(soft[mask].mean() * 100.0) if area > 0 else 0.0
-            status_var.set(
-                f"Circles: {len(kept_circles)} | Coverage: {cov:.1f}%"
-            )
+            _show_seg_overlay(soft_lo, analysis_circles, levels)
+            last_full_coverage_pct[0] = None
+            status_var.set(_seg_status_text(len(kept_circles), None))
             value_labels["threshold"].set(f"{seg.threshold:.0f}")
-            value_labels["fuzziness"].set(f"{seg.fuzziness:.0f}")
             value_labels["min_size"].set(f"{seg.min_size}")
             value_labels["max_size"].set(f"{seg.max_size}")
             value_labels["gap_fill"].set(f"{seg.gap_fill}")
             value_labels["split"].set(f"{seg.split}")
+            schedule_full_seg_refresh()
+            return
 
         photo = ImageTk.PhotoImage(preview)
         photo_ref[0] = photo
@@ -623,23 +695,19 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
         on_change=schedule_seg_refresh,
     )
     add_slider(
-        seg_controls, 1, "fuzziness", fuzziness_var, 0, 64, "fuzziness", 1,
+        seg_controls, 1, "gap fill px", gap_fill_var, 0, 20, "gap_fill", 1,
         on_change=schedule_seg_refresh,
     )
     add_slider(
-        seg_controls, 2, "gap fill px", gap_fill_var, 0, 20, "gap_fill", 1,
+        seg_controls, 2, "split px", split_var, 0, 20, "split", 1,
         on_change=schedule_seg_refresh,
     )
     add_slider(
-        seg_controls, 3, "split px", split_var, 0, 20, "split", 1,
+        seg_controls, 3, "min island px", min_size_var, 0, 5000, "min_size", 1,
         on_change=schedule_seg_refresh,
     )
     add_slider(
-        seg_controls, 4, "min island px", min_size_var, 0, 5000, "min_size", 1,
-        on_change=schedule_seg_refresh,
-    )
-    add_slider(
-        seg_controls, 5, "max island px", max_size_var, 0, 200000, "max_size", 50,
+        seg_controls, 4, "max island px", max_size_var, 0, 200000, "max_size", 50,
         on_change=schedule_seg_refresh,
     )
 
@@ -648,6 +716,9 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
 
     def show_step(n: int) -> None:
         step["n"] = n
+        if full_seg_debounce_id[0] is not None:
+            root.after_cancel(full_seg_debounce_id[0])
+            full_seg_debounce_id[0] = None
         if n == 1:
             step_var.set("Step 1 of 2 — Circles & Levels")
             if single_mode["on"]:
@@ -667,13 +738,15 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             hint_var.set(
                 "Pink = GLC islands (darker than threshold)\n"
                 "gap fill joins within an island; split breaks bridges\n"
-                "min/max island size filters speckles / huge blobs"
+                "min/max island size filters speckles / huge blobs\n"
+                "Coverage uses full resolution (matches the report)"
             )
             step1_frame.pack_forget()
             step2_frame.pack(fill=tk.X)
             preview_label.configure(cursor="")
             next_btn.configure(text="Finish", command=on_finish)
             back_btn.pack(fill=tk.X, pady=(0, 4), before=next_btn)
+            last_full_coverage_pct[0] = None
         refresh_preview(redetect=True)
 
     def on_reset() -> None:
@@ -698,14 +771,19 @@ def run_quantify_wizard(image_path: Path) -> QuantifySession | None:
             cached_detect_key[0] = None
             leveled_cache_key[0] = None
             leveled_cache_img[0] = None
+            display_leveled_cache_key[0] = None
+            display_leveled_cache_img[0] = None
+            full_leveled_cache_key[0] = None
+            full_leveled_cache_img[0] = None
+            last_full_coverage_pct[0] = None
             refresh_preview(redetect=True)
         else:
             threshold_var.set(seg_defaults.threshold)
-            fuzziness_var.set(seg_defaults.fuzziness)
             min_size_var.set(float(seg_defaults.min_size))
             max_size_var.set(float(seg_defaults.max_size))
             gap_fill_var.set(float(seg_defaults.gap_fill))
             split_var.set(float(seg_defaults.split))
+            last_full_coverage_pct[0] = None
             refresh_preview(redetect=False)
 
     def on_next() -> None:

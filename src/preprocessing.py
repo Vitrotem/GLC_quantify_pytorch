@@ -31,10 +31,10 @@ DEFAULT_LEVELS_BLACK = 0.0
 DEFAULT_LEVELS_GAMMA = 1.0
 DEFAULT_LEVELS_WHITE = 255.0
 DEFAULT_SEG_THRESHOLD = 128.0
-DEFAULT_SEG_FUZZINESS = 10.0
-DEFAULT_SEG_MIN_SIZE = 50
+DEFAULT_SEG_FUZZINESS = 0.0  # hard threshold; soft ramp unused in UI
+DEFAULT_SEG_MIN_SIZE = 100
 DEFAULT_SEG_MAX_SIZE = 0  # 0 = no upper limit
-DEFAULT_SEG_GAP_FILL = 2  # closing radius (px); solidify islands without merging much
+DEFAULT_SEG_GAP_FILL = 1  # closing radius (px); solidify islands without merging much
 DEFAULT_SEG_SPLIT = 0  # opening radius (px); break thin bridges between islands
 DEFAULT_INNER_OFFSET_PCT = 0.0
 
